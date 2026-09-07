@@ -162,11 +162,38 @@ async function handleWatch(anilistId, audio, epNum) {
     }
 
     const rawServers = Array.isArray(props.servers) ? props.servers : [];
+    const selectedServers = rawServers.filter((server) =>
+      Boolean(server.dub) === (audio === "dub") && typeof server.slug === "string" && server.slug
+    );
+    const babaStreams = selectedServers.filter((server) => /babastream\.top\/embed\//i.test(server.slug));
+    const megaStreams = selectedServers.filter((server) => /megaplay\.[^/]+\/stream\//i.test(server.slug));
+
+    for (const server of babaStreams) {
+      streams.push({
+        server: server.server_name || "BabaStream",
+        url: server.slug,
+        type: "embed",
+      });
+    }
+
+    const babaResults = await Promise.allSettled(babaStreams.map(async (server) => ({
+      embed: server.slug,
+      source: await extractBabaStreamDetails(server.slug, { userAgent: UA, referer }),
+    })));
+    for (const result of babaResults) {
+      if (result.status !== "fulfilled" || !result.value.source?.url) continue;
+      streams.push({
+        server: "BabaStream",
+        url: result.value.source.url,
+        type: result.value.source.type,
+        embed: result.value.embed,
+        referer: `${result.value.source.origin}/`,
+      });
+    }
+
     const defaultMegaPlay = `https://megaplay.buzz/stream/mal/${malId}/${epNum}/${audio}`;
     const megaPlayEmbeds = [...new Set([
-      ...rawServers
-        .filter((server) => Boolean(server.dub) === (audio === "dub") && /megaplay\.[^/]+\/stream\//i.test(String(server.slug)))
-        .map((server) => server.slug),
+      ...megaStreams.map((server) => server.slug),
       defaultMegaPlay,
     ])];
     const megaPlayResults = await Promise.allSettled(megaPlayEmbeds.map(async (embed) => ({
@@ -190,10 +217,8 @@ async function handleWatch(anilistId, audio, epNum) {
         streams.push(stream);
       }
     }
-    for (const server of rawServers) {
-      if (Boolean(server.dub) !== (audio === "dub")) continue;
-      if (!server.slug) continue;
-      if (server.server_name === "HAdfree") continue;
+
+    for (const server of megaStreams) {
       streams.push({
         server: server.server_name || "Embed",
         url: server.slug,
@@ -201,29 +226,24 @@ async function handleWatch(anilistId, audio, epNum) {
       });
     }
 
-    const babaStreams = rawServers.filter((server) =>
-      Boolean(server.dub) === (audio === "dub") &&
-      typeof server.slug === "string" &&
-      /babastream\.top\/embed\//i.test(server.slug)
-    );
-    const babaHls = await Promise.allSettled(babaStreams.map(async (server) => ({
-      embed: server.slug,
-      source: await extractBabaStreamDetails(server.slug, { userAgent: UA, referer }),
-    })));
-    for (const result of babaHls) {
-      if (result.status !== "fulfilled" || !result.value.source?.url) continue;
+    if (!streams.some((stream) => stream.url === defaultMegaPlay)) {
       streams.push({
-        server: "BabaStream",
-        url: result.value.source.url,
-        type: result.value.source.type,
-        embed: result.value.embed,
-        referer: `${result.value.source.origin}/`,
+        server: audio === "dub" ? "MegaPlay Dub" : "MegaPlay Sub",
+        url: defaultMegaPlay,
+        type: "embed",
       });
     }
 
-    const hadfreeEntries = rawServers.filter(s =>
-      s.server_name === "HAdfree" && Boolean(s.dub) === (audio === "dub") && s.slug
-    );
+    for (const server of selectedServers) {
+      if (server.server_name === "HAdfree" || babaStreams.includes(server) || megaStreams.includes(server)) continue;
+      streams.push({
+        server: server.server_name || "Embed",
+        url: server.slug,
+        type: "embed",
+      });
+    }
+
+    const hadfreeEntries = selectedServers.filter((server) => server.server_name === "HAdfree");
 
     const hadfreeResults = await Promise.allSettled(
       hadfreeEntries.map(entry =>
@@ -240,10 +260,11 @@ async function handleWatch(anilistId, audio, epNum) {
     }
   }
 
-  if (!streams.some((s) => s.url === `https://megaplay.buzz/stream/mal/${malId}/${epNum}/${audio === "dub" ? "dub" : "sub"}`)) {
+  const defaultMegaPlay = `https://megaplay.buzz/stream/mal/${malId}/${epNum}/${audio}`;
+  if (!streams.some((s) => s.url === defaultMegaPlay)) {
     streams.push({
       server: audio === "dub" ? "MegaPlay Dub" : "MegaPlay Sub",
-      url: `https://megaplay.buzz/stream/mal/${malId}/${epNum}/${audio === "dub" ? "dub" : "sub"}`,
+      url: defaultMegaPlay,
       type: "embed",
     });
   }
