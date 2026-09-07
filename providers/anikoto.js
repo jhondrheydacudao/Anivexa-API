@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import { getMedia } from '../core/anilist.js';
 
 const ANIKOTO = "https://anikototv.to";
@@ -155,6 +156,58 @@ function mapTrack(t, source) {
   };
 }
 
+function decodeScriptString(value) {
+  return value.replace(/\\u([\dA-Fa-f]{4})|\\x([\dA-Fa-f]{2})|\\([\\'"bnfrtv0])/g, (_, unicode, hex, escaped) => {
+    if (unicode) return String.fromCharCode(Number.parseInt(unicode, 16));
+    if (hex) return String.fromCharCode(Number.parseInt(hex, 16));
+    return { b: "\b", n: "\n", f: "\f", r: "\r", t: "\t", v: "\v", 0: "\0" }[escaped] ?? escaped;
+  });
+}
+
+function getScriptStrings(script) {
+  const strings = new Set();
+  for (const match of script.matchAll(/"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'/g)) strings.add(decodeScriptString(match[1] ?? match[2]));
+  return [...strings];
+}
+
+function getMegaPlayRoutes(script) {
+  const routes = [...script.matchAll(/["'](stream\/getSources[\w/-]*)["']/gi)]
+    .map((match) => match[1])
+    .sort((left, right) => left.length - right.length);
+  const legacy = routes[0] ?? null;
+  const modern = routes.find((route) => route !== legacy && route.startsWith(legacy)) ?? null;
+  return { legacy, modern };
+}
+
+function decryptMegaPlaySource(value, script) {
+  if (!value) return null;
+  const encrypted = Buffer.from(value, "base64url");
+  if (!encrypted.length || encrypted.length % 16) return null;
+  const values = getScriptStrings(script).filter((item) => Buffer.byteLength(item) > 0 && Buffer.byteLength(item) <= 32);
+  const ivs = values.filter((item) => Buffer.byteLength(item) === 16);
+  for (const keyValue of values) {
+    const key = Buffer.alloc(32);
+    Buffer.from(keyValue).copy(key);
+    for (const ivValue of ivs) {
+      try {
+        const decipher = crypto.createDecipheriv("aes-256-cbc", key, Buffer.from(ivValue));
+        const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+        const data = JSON.parse(decrypted.toString("utf8"));
+        const source = data?.file ?? data?.url;
+        if (typeof source === "string" && source) return source;
+      } catch {}
+    }
+  }
+  return null;
+}
+
+function buildMegaPlaySourceUrl(origin, path, fileId) {
+  const endpoint = new URL(path, origin);
+  endpoint.searchParams.append("id", fileId);
+  endpoint.searchParams.append("id", fileId);
+  return endpoint;
+}
+
 async function extractEmbedSource(embedUrl) {
   try {
     const pageHtml = await httpGet(embedUrl, { Referer: SPOOF_REF, "Accept-Language": "en-US,en;q=0.9" });
@@ -162,8 +215,26 @@ async function extractEmbedSource(embedUrl) {
     if (!m?.[1]) return null;
     const fileId = m[1];
     const origin = new URL(embedUrl).origin;
-    const data = await getJSON(`${origin}/stream/getSources?id=${fileId}&id=${fileId}`, { Referer: `${origin}/`, "X-Requested-With": "XMLHttpRequest" });
-    return { fileId, data, origin };
+    const headers = { Referer: embedUrl, "X-Requested-With": "XMLHttpRequest" };
+    const clientScript = [...pageHtml.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)]
+      .map((match) => new URL(match[1], embedUrl).href)
+      .find((url) => /newclient[^/]*\.js/i.test(url));
+    if (!clientScript) return null;
+    const script = await httpGet(clientScript, { Referer: embedUrl });
+    const routes = getMegaPlayRoutes(script);
+    const modern = routes.modern
+      ? await getJSON(buildMegaPlaySourceUrl(origin, routes.modern, fileId), headers).catch(() => null)
+      : null;
+    const legacy = routes.legacy
+      ? await getJSON(buildMegaPlaySourceUrl(origin, routes.legacy, fileId), headers).catch(() => null)
+      : null;
+    const source = legacy?.sources?.file ?? decryptMegaPlaySource(legacy?.enc, script);
+    const sources = [
+      modern?.sources?.file ? { url: modern.sources.file, variant: "modern" } : null,
+      source ? { url: source, variant: "legacy" } : null,
+    ].filter((item, index, all) => item && all.findIndex((candidate) => candidate?.url === item.url) === index);
+    if (!sources.length) return null;
+    return { fileId, data: modern ?? legacy, origin, sources };
   } catch (e) {
     return null;
   }
@@ -387,14 +458,14 @@ async function handleWatch(anilistId, audio, epNum, ctx = {}) {
       if (s || e) serverOutro = { start: Number(s) || 0, end: Number(e) || 0 };
     }
 
-    let hlsUrl = null;
+    const hlsSources = [];
 
     if (embedUrl.includes("#aHR0c")) {
       const b64 = embedUrl.split("#")[1];
       try {
         const decodedUrl = atob(b64);
         if (decodedUrl.includes(".m3u8")) {
-          hlsUrl = decodedUrl;
+          hlsSources.push({ url: decodedUrl, variant: null });
         }
       } catch (e) {}
     }
@@ -402,8 +473,10 @@ async function handleWatch(anilistId, audio, epNum, ctx = {}) {
     const extracted = await extractEmbedSource(embedUrl);
     const itemSubs = [];
 
-    if (extracted?.data?.sources?.file) {
-      hlsUrl = extracted.data.sources.file;
+    if (extracted?.sources?.length) {
+      for (const source of extracted.sources) {
+        if (!hlsSources.some((item) => item.url === source.url)) hlsSources.push(source);
+      }
 
       for (const t of extracted.data.tracks ?? []) {
         const mapped = mapTrack(t, item.name);
@@ -422,20 +495,31 @@ async function handleWatch(anilistId, audio, epNum, ctx = {}) {
       }
     }
 
-    if (hlsUrl) {
-      const streamObj = {
-        url: hlsUrl,
-        type: "hls",
+    if (hlsSources.length) {
+      for (const source of hlsSources) {
+        const streamObj = {
+          url: source.url,
+          type: "hls",
+          server: item.name,
+          embedUrl,
+          referer: extracted?.origin ? `${extracted.origin}/` : `${new URL(embedUrl).origin}/`,
+          subtitles: itemSubs,
+          priority: streams.length ? 4 : 5,
+          isActive: streams.length === 0
+        };
+        if (source.variant) streamObj.variant = source.variant;
+        if (serverIntro.start || serverIntro.end) streamObj.intro = serverIntro;
+        if (serverOutro.start || serverOutro.end) streamObj.outro = serverOutro;
+        streams.push(streamObj);
+      }
+      streams.push({
+        url: embedUrl,
+        type: "embed",
         server: item.name,
-        embedUrl,
-        referer: extracted?.origin ? `${extracted.origin}/` : `${new URL(embedUrl).origin}/`,
-        subtitles: itemSubs,
-        priority: 5,
-        isActive: streams.length === 0
-      };
-      if (serverIntro.start || serverIntro.end) streamObj.intro = serverIntro;
-      if (serverOutro.start || serverOutro.end) streamObj.outro = serverOutro;
-      streams.push(streamObj);
+        referer: `${new URL(embedUrl).origin}/`,
+        priority: 4,
+        isActive: false
+      });
     } else {
       const streamObj = {
         url: embedUrl,
