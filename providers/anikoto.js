@@ -1,5 +1,5 @@
-import crypto from "node:crypto";
 import { getMedia } from '../core/anilist.js';
+import { extractMegaPlayDetails } from "../extractors/megaplay.js";
 
 const ANIKOTO = "https://anikototv.to";
 const MAPPER = "https://mapper.nekostream.site/api/mal";
@@ -156,85 +156,9 @@ function mapTrack(t, source) {
   };
 }
 
-function decodeScriptString(value) {
-  return value.replace(/\\u([\dA-Fa-f]{4})|\\x([\dA-Fa-f]{2})|\\([\\'"bnfrtv0])/g, (_, unicode, hex, escaped) => {
-    if (unicode) return String.fromCharCode(Number.parseInt(unicode, 16));
-    if (hex) return String.fromCharCode(Number.parseInt(hex, 16));
-    return { b: "\b", n: "\n", f: "\f", r: "\r", t: "\t", v: "\v", 0: "\0" }[escaped] ?? escaped;
-  });
-}
-
-function getScriptStrings(script) {
-  const strings = new Set();
-  for (const match of script.matchAll(/"((?:\\.|[^"\\])*)"|'((?:\\.|[^'\\])*)'/g)) strings.add(decodeScriptString(match[1] ?? match[2]));
-  return [...strings];
-}
-
-function getMegaPlayRoutes(script) {
-  const routes = [...script.matchAll(/["'](stream\/getSources[\w/-]*)["']/gi)]
-    .map((match) => match[1])
-    .sort((left, right) => left.length - right.length);
-  const legacy = routes[0] ?? null;
-  const modern = routes.find((route) => route !== legacy && route.startsWith(legacy)) ?? null;
-  return { legacy, modern };
-}
-
-function decryptMegaPlaySource(value, script) {
-  if (!value) return null;
-  const encrypted = Buffer.from(value, "base64url");
-  if (!encrypted.length || encrypted.length % 16) return null;
-  const values = getScriptStrings(script).filter((item) => Buffer.byteLength(item) > 0 && Buffer.byteLength(item) <= 32);
-  const ivs = values.filter((item) => Buffer.byteLength(item) === 16);
-  for (const keyValue of values) {
-    const key = Buffer.alloc(32);
-    Buffer.from(keyValue).copy(key);
-    for (const ivValue of ivs) {
-      try {
-        const decipher = crypto.createDecipheriv("aes-256-cbc", key, Buffer.from(ivValue));
-        const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
-        const data = JSON.parse(decrypted.toString("utf8"));
-        const source = data?.file ?? data?.url;
-        if (typeof source === "string" && source) return source;
-      } catch {}
-    }
-  }
-  return null;
-}
-
-function buildMegaPlaySourceUrl(origin, path, fileId) {
-  const endpoint = new URL(path, origin);
-  endpoint.searchParams.append("id", fileId);
-  endpoint.searchParams.append("id", fileId);
-  return endpoint;
-}
-
 async function extractEmbedSource(embedUrl) {
   try {
-    const pageHtml = await httpGet(embedUrl, { Referer: SPOOF_REF, "Accept-Language": "en-US,en;q=0.9" });
-    const m = pageHtml.match(/data-id="([^"]*)"/);
-    if (!m?.[1]) return null;
-    const fileId = m[1];
-    const origin = new URL(embedUrl).origin;
-    const headers = { Referer: embedUrl, "X-Requested-With": "XMLHttpRequest" };
-    const clientScript = [...pageHtml.matchAll(/<script[^>]+src=["']([^"']+)["']/gi)]
-      .map((match) => new URL(match[1], embedUrl).href)
-      .find((url) => /newclient[^/]*\.js/i.test(url));
-    if (!clientScript) return null;
-    const script = await httpGet(clientScript, { Referer: embedUrl });
-    const routes = getMegaPlayRoutes(script);
-    const modern = routes.modern
-      ? await getJSON(buildMegaPlaySourceUrl(origin, routes.modern, fileId), headers).catch(() => null)
-      : null;
-    const legacy = routes.legacy
-      ? await getJSON(buildMegaPlaySourceUrl(origin, routes.legacy, fileId), headers).catch(() => null)
-      : null;
-    const source = legacy?.sources?.file ?? decryptMegaPlaySource(legacy?.enc, script);
-    const sources = [
-      modern?.sources?.file ? { url: modern.sources.file, variant: "modern" } : null,
-      source ? { url: source, variant: "legacy" } : null,
-    ].filter((item, index, all) => item && all.findIndex((candidate) => candidate?.url === item.url) === index);
-    if (!sources.length) return null;
-    return { fileId, data: modern ?? legacy, origin, sources };
+    return await extractMegaPlayDetails(embedUrl, { userAgent: UA, referer: SPOOF_REF });
   } catch (e) {
     return null;
   }
@@ -478,7 +402,7 @@ async function handleWatch(anilistId, audio, epNum, ctx = {}) {
         if (!hlsSources.some((item) => item.url === source.url)) hlsSources.push(source);
       }
 
-      for (const t of extracted.data.tracks ?? []) {
+      for (const t of extracted.tracks ?? []) {
         const mapped = mapTrack(t, item.name);
         itemSubs.push(mapped);
         if (!subSeen.has(mapped.url)) {
@@ -487,11 +411,11 @@ async function handleWatch(anilistId, audio, epNum, ctx = {}) {
         }
       }
 
-      if (extracted.data.intro?.start || extracted.data.intro?.end) {
-        serverIntro = { start: Number(extracted.data.intro.start) || 0, end: Number(extracted.data.intro.end) || 0 };
+      if (extracted.intro?.start || extracted.intro?.end) {
+        serverIntro = { start: Number(extracted.intro.start) || 0, end: Number(extracted.intro.end) || 0 };
       }
-      if (extracted.data.outro?.start || extracted.data.outro?.end) {
-        serverOutro = { start: Number(extracted.data.outro.start) || 0, end: Number(extracted.data.outro.end) || 0 };
+      if (extracted.outro?.start || extracted.outro?.end) {
+        serverOutro = { start: Number(extracted.outro.start) || 0, end: Number(extracted.outro.end) || 0 };
       }
     }
 
