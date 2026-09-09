@@ -30,16 +30,34 @@ const AL_STATUS_MAP = {
   HIATUS: "HIATUS",
 };
 
+// Wraps fetch with an abort-based timeout so a hung/slow endpoint (e.g. AniList or ARM
+// accepting a connection but never responding) can't stall the whole request pipeline.
+// Returns null on timeout, network error, or any thrown exception — never throws.
+async function fetchWithTimeout(url, opts = {}, timeoutMs = 5000) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...opts, signal: controller.signal });
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(t);
+  }
+}
+__name(fetchWithTimeout, "fetchWithTimeout");
+
 async function fetchFromAniList(id) {
-  const fullQuery = `query($id:Int){Media(id:$id,type:ANIME){id title{english romaji native} status format episodes seasonYear startDate{year} synonyms nextAiringEpisode{episode airingAt timeUntilAiring}}}`;
-  const res = await fetch("https://graphql.anilist.co", {
+  // idMal is included so AniList itself can supply the MyAnimeList id, removing the
+  // hard dependency on the ARM lookup service (which may be down independently).
+  const fullQuery = `query($id:Int){Media(id:$id,type:ANIME){id idMal title{english romaji native} status format episodes seasonYear startDate{year} synonyms nextAiringEpisode{episode airingAt timeUntilAiring}}}`;
+  const res = await fetchWithTimeout("https://graphql.anilist.co", {
     method: "POST",
     headers: { "Content-Type": "application/json", "Accept": "application/json", "User-Agent": UA },
     body: JSON.stringify({ query: fullQuery, variables: { id } }),
-  }).catch(() => null);
+  }, 5000);
   if (!res || !res.ok) return null;
-  const json = await res.json();
-  return json.data?.Media ?? null;
+  const json = await res.json().catch(() => null);
+  return json?.data?.Media ?? null;
 }
 __name(fetchFromAniList, "fetchFromAniList");
 
@@ -50,9 +68,9 @@ __name(fetchFromAniList, "fetchFromAniList");
 async function fetchFromMALv2(malId) {
   if (!MAL_CLIENT_ID) return null;
   const fields = "id,title,alternative_titles,status,media_type,num_episodes,start_date,start_season";
-  const res = await fetch(`${MAL_API}/anime/${malId}?fields=${fields}`, {
+  const res = await fetchWithTimeout(`${MAL_API}/anime/${malId}?fields=${fields}`, {
     headers: { "X-MAL-CLIENT-ID": MAL_CLIENT_ID, "Accept": "application/json", "User-Agent": UA },
-  }).catch(() => null);
+  }, 5000);
   if (!res || !res.ok) return null;
   const d = await res.json().catch(() => null);
   if (!d || !d.id) return null;
@@ -101,9 +119,9 @@ async function fetchFromAnikoto(name) {
   if (!name) return null;
   const slug = slugify(name);
   if (!slug) return null;
-  const pageRes = await fetch(`${ANIKOTO}/page?name=${encodeURIComponent(slug)}`, {
+  const pageRes = await fetchWithTimeout(`${ANIKOTO}/page?name=${encodeURIComponent(slug)}`, {
     headers: { "Accept": "application/json", "User-Agent": UA },
-  }).catch(() => null);
+  }, 5000);
   if (!pageRes || !pageRes.ok) return null;
   // Read as text rather than .json() — the body is a bare id like `8711`, sometimes
   // quoted, and not always served with an application/json content-type, which can
@@ -114,9 +132,9 @@ async function fetchFromAnikoto(name) {
   if (!dataId) return null;
 
   let episodes = null;
-  const epRes = await fetch(`${ANIKOTO}/episodes?id=${encodeURIComponent(dataId)}`, {
+  const epRes = await fetchWithTimeout(`${ANIKOTO}/episodes?id=${encodeURIComponent(dataId)}`, {
     headers: { "Accept": "application/json", "User-Agent": UA },
-  }).catch(() => null);
+  }, 5000);
   if (epRes && epRes.ok) {
     const epData = await epRes.json().catch(() => null);
     if (Array.isArray(epData)) episodes = epData.length;
@@ -144,17 +162,23 @@ async function getMedia(anilistId, options) {
   if (resolved.has(id)) return resolved.get(id);
   if (inflight.has(id)) return inflight.get(id);
   const promise = (async () => {
-    const arm = await fetch(`${ARM}?source=anilist&id=${id}`, {
-      headers: { "User-Agent": UA, "Accept": "application/json" }
-    }).then((r) => {
-      if (!r.ok) return null;
-      return r.json();
-    }).catch(() => null);
+    // AniList is the primary source now, including for the MAL id (idMal), so ARM is
+    // only consulted as a fallback if AniList doesn't give us idMal for some reason.
+    const al = await fetchFromAniList(id);
 
-    const malId = arm?.myanimelist ?? null;
+    let malId = al?.idMal ?? null;
 
     if (!malId) {
-      const al = await fetchFromAniList(id);
+      const arm = await fetchWithTimeout(`${ARM}?source=anilist&id=${id}`, {
+        headers: { "User-Agent": UA, "Accept": "application/json" }
+      }, 5000).then((r) => {
+        if (!r || !r.ok) return null;
+        return r.json().catch(() => null);
+      }).catch(() => null);
+      malId = arm?.myanimelist ?? null;
+    }
+
+    if (!malId) {
       if (!al) {
         // AniList had nothing either: try anikoto as an absolute last resort.
         const aniko = await fetchFromAnikoto(anikotoName);
@@ -187,7 +211,7 @@ async function getMedia(anilistId, options) {
       return media;
     }
 
-    const al = await fetchFromAniList(id).catch(() => null);
+    // `al` is already fetched above — no need to fetch AniList again here.
     let jikan = null;
     let jikanFailed = false;
     for (let attempt = 0; attempt <= 4; attempt++) {
