@@ -78,7 +78,8 @@ __name(fetchFromMALv2, "fetchFromMALv2");
 // Turns a title into the kind of slug anikoto expects (e.g. "One Piece" -> "one-piece").
 // Best-effort only — anikoto's real slugs sometimes carry extra suffixes (e.g. "-odmau")
 // that can't be derived from the title alone, so this is a fallback for when no explicit
-// slug/name was supplied, not a guaranteed match.
+// slug/name was supplied, not a guaranteed match. /page's own lookup tolerates the base
+// slug without that suffix, so this is sufficient to resolve the data-id.
 function slugify(title) {
   if (!title) return null;
   return title
@@ -97,7 +98,9 @@ __name(slugify, "slugify");
 // Returns a media object shaped like the others, or null if any step fails.
 async function fetchFromAnikoto(name) {
   if (!name) return null;
-  const pageRes = await fetch(`${ANIKOTO}/page?name=${encodeURIComponent(name)}`, {
+  const slug = slugify(name);
+  if (!slug) return null;
+  const pageRes = await fetch(`${ANIKOTO}/page?name=${encodeURIComponent(slug)}`, {
     headers: { "Accept": "application/json", "User-Agent": UA },
   }).catch(() => null);
   if (!pageRes || !pageRes.ok) return null;
@@ -272,16 +275,3 @@ async function getMedia(anilistId, options) {
     inflight.delete(id);
     return media;
   })().catch((e) => {
-    inflight.delete(id);
-    throw e;
-  });
-  inflight.set(id, promise);
-  return promise;
-}
-__name(getMedia, "getMedia");
-
-function forgetMedia(anilistId) {
-  resolved.delete(Number(anilistId));
-}
-
-export { getMedia, forgetMedia };
