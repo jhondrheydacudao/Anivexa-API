@@ -227,4 +227,4 @@ function forgetMedia(anilistId) {
 }
 __name(forgetMedia, "forgetMedia");
 
-export { getMedia, forgetMedia };
+export { getMedia, forgetMedia }
