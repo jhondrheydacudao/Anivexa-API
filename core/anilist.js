@@ -7,6 +7,7 @@ var ARM = "https://arm.haglund.dev/api/v2/ids";
 var JIKAN = "https://api.jikan.moe/v4";
 var MAL_API = "https://api.myanimelist.net/v2";
 var MAL_CLIENT_ID = process.env.MAL_CLIENT_ID ?? null;
+var ANIKOTO = "https://anikoto.wispbyte.app";
 var STATUS_MAP = {
   "Currently Airing": "RELEASING",
   "Finished Airing": "FINISHED",
@@ -74,7 +75,62 @@ async function fetchFromMALv2(malId) {
 }
 __name(fetchFromMALv2, "fetchFromMALv2");
 
-async function getMedia(anilistId) {
+// Turns a title into the kind of slug anikoto expects (e.g. "One Piece" -> "one-piece").
+// Best-effort only — anikoto's real slugs sometimes carry extra suffixes (e.g. "-odmau")
+// that can't be derived from the title alone, so this is a fallback for when no explicit
+// slug/name was supplied, not a guaranteed match.
+function slugify(title) {
+  if (!title) return null;
+  return title
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9\s-]/g, "")
+    .trim()
+    .replace(/\s+/g, "-");
+}
+__name(slugify, "slugify");
+
+// Absolute last resort: anikoto's /page endpoint resolves a title slug to its internal
+// data-id (returned as a JSON string, e.g. "1642"). We use that id to pull an episode
+// count from /episodes so we can at least return something rather than nothing.
+// Returns a media object shaped like the others, or null if any step fails.
+async function fetchFromAnikoto(name) {
+  if (!name) return null;
+  const pageRes = await fetch(`${ANIKOTO}/page?name=${encodeURIComponent(name)}`, {
+    headers: { "Accept": "application/json", "User-Agent": UA },
+  }).catch(() => null);
+  if (!pageRes || !pageRes.ok) return null;
+  const dataId = await pageRes.json().catch(() => null); // e.g. "1642"
+  if (!dataId) return null;
+
+  let episodes = null;
+  const epRes = await fetch(`${ANIKOTO}/episodes?id=${encodeURIComponent(dataId)}`, {
+    headers: { "Accept": "application/json", "User-Agent": UA },
+  }).catch(() => null);
+  if (epRes && epRes.ok) {
+    const epData = await epRes.json().catch(() => null);
+    if (Array.isArray(epData)) episodes = epData.length;
+  }
+
+  return {
+    id: null, // caller fills in the AniList id
+    idMal: null, // caller fills in if known
+    idAnikoto: dataId,
+    title: { english: null, romaji: name, native: null },
+    status: "RELEASING",
+    format: null,
+    episodes,
+    seasonYear: null,
+    startDate: null,
+    nextAiringEpisode: null,
+    synonyms: [],
+  };
+}
+__name(fetchFromAnikoto, "fetchFromAnikoto");
+
+async function getMedia(anilistId, options) {
+  const anikotoName = options?.anikotoName ?? null;
   const id = Number(anilistId);
   if (resolved.has(id)) return resolved.get(id);
   if (inflight.has(id)) return inflight.get(id);
@@ -90,7 +146,17 @@ async function getMedia(anilistId) {
 
     if (!malId) {
       const al = await fetchFromAniList(id);
-      if (!al) throw new Error(`No data found for AniList ID ${id}`);
+      if (!al) {
+        // AniList had nothing either: try anikoto as an absolute last resort.
+        const aniko = await fetchFromAnikoto(anikotoName);
+        if (aniko) {
+          aniko.id = id;
+          resolved.set(id, aniko);
+          inflight.delete(id);
+          return aniko;
+        }
+        throw new Error(`No data found for AniList ID ${id} (anikoto fallback also failed or no name supplied)`);
+      }
       const media = {
         id,
         idMal: null,
@@ -158,7 +224,7 @@ async function getMedia(anilistId) {
       inflight.delete(id);
       return media;
     }
-    // Jikan failed AND AniList has nothing usable: try the official MyAnimeList API v2 as a last resort.
+    // Jikan failed AND AniList has nothing usable: try the official MyAnimeList API v2 next.
     if (!d && !al) {
       const mal = await fetchFromMALv2(malId);
       if (mal) {
@@ -167,10 +233,19 @@ async function getMedia(anilistId) {
         inflight.delete(id);
         return mal;
       }
+      // MAL API v2 also failed (or no client id configured): try anikoto as the absolute last resort.
+      const aniko = await fetchFromAnikoto(anikotoName);
+      if (aniko) {
+        aniko.id = id;
+        aniko.idMal = malId;
+        resolved.set(id, aniko);
+        inflight.delete(id);
+        return aniko;
+      }
       throw new Error(
         jikanFailed
-          ? `Jikan failed and AniList had no data for MAL ID ${malId} (MAL API v2 fallback also failed or unavailable)`
-          : `Jikan returned no data for MAL ID ${malId} (AniList and MAL API v2 fallback also failed)`
+          ? `Jikan failed and AniList had no data for MAL ID ${malId} (MAL API v2 and anikoto fallbacks also failed)`
+          : `Jikan returned no data for MAL ID ${malId} (AniList, MAL API v2, and anikoto fallbacks also failed)`
       );
     }
     if (!d) throw new Error(`Jikan returned no data for MAL ID ${malId}`);
