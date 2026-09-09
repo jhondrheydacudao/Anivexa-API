@@ -93,9 +93,10 @@ function slugify(title) {
 __name(slugify, "slugify");
 
 // Absolute last resort: anikoto's /page endpoint resolves a title slug to its internal
-// data-id (returned as a JSON string, e.g. "1642"). We use that id to pull an episode
-// count from /episodes so we can at least return something rather than nothing.
-// Returns a media object shaped like the others, or null if any step fails.
+// data-id, returned as a plain-text/number body (e.g. "8711"), not a typed JSON payload.
+// We use that id to pull an episode count from /episodes so we can at least return
+// something rather than nothing. Returns a media object shaped like the others, or
+// null if any step fails.
 async function fetchFromAnikoto(name) {
   if (!name) return null;
   const slug = slugify(name);
@@ -104,7 +105,12 @@ async function fetchFromAnikoto(name) {
     headers: { "Accept": "application/json", "User-Agent": UA },
   }).catch(() => null);
   if (!pageRes || !pageRes.ok) return null;
-  const dataId = await pageRes.json().catch(() => null); // e.g. "1642"
+  // Read as text rather than .json() — the body is a bare id like `8711`, sometimes
+  // quoted, and not always served with an application/json content-type, which can
+  // trip up strict fetch implementations' .json() parsing.
+  const pageText = await pageRes.text().catch(() => null);
+  if (!pageText) return null;
+  const dataId = pageText.trim().replace(/^"(.*)"$/, "$1"); // strip surrounding quotes if present
   if (!dataId) return null;
 
   let episodes = null;
@@ -275,3 +281,16 @@ async function getMedia(anilistId, options) {
     inflight.delete(id);
     return media;
   })().catch((e) => {
+    inflight.delete(id);
+    throw e;
+  });
+  inflight.set(id, promise);
+  return promise;
+}
+__name(getMedia, "getMedia");
+
+function forgetMedia(anilistId) {
+  resolved.delete(Number(anilistId));
+}
+
+export { getMedia, forgetMedia };
