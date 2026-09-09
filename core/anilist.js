@@ -1,3 +1,4 @@
+// src/core/anilist.js
 const __name = (fn, _) => fn;
 
 var resolved = new Map();
@@ -8,6 +9,8 @@ var JIKAN = "https://api.jikan.moe/v4";
 var MAL_API = "https://api.myanimelist.net/v2";
 var MAL_CLIENT_ID = process.env.MAL_CLIENT_ID ?? null;
 var ANIKOTO = "https://anikoto.wispbyte.app";
+var DEFAULT_TIMEOUT_MS = 5000;
+
 var STATUS_MAP = {
   "Currently Airing": "RELEASING",
   "Finished Airing": "FINISHED",
@@ -15,14 +18,13 @@ var STATUS_MAP = {
   "On Hiatus": "HIATUS"
 };
 
-// Status enum used by the official MyAnimeList API v2 (distinct from Jikan's STATUS_MAP strings above).
 var MAL_V2_STATUS_MAP = {
   currently_airing: "RELEASING",
   finished_airing: "FINISHED",
   not_yet_aired: "NOT_YET_RELEASED",
 };
 
-const AL_STATUS_MAP = {
+var AL_STATUS_MAP = {
   RELEASING: "RELEASING",
   FINISHED: "FINISHED",
   NOT_YET_RELEASED: "NOT_YET_RELEASED",
@@ -30,10 +32,8 @@ const AL_STATUS_MAP = {
   HIATUS: "HIATUS",
 };
 
-// Wraps fetch with an abort-based timeout so a hung/slow endpoint (e.g. AniList or ARM
-// accepting a connection but never responding) can't stall the whole request pipeline.
-// Returns null on timeout, network error, or any thrown exception — never throws.
-async function fetchWithTimeout(url, opts = {}, timeoutMs = 5000) {
+// Wraps fetch with an abort-based timeout. Returns null on timeout/network error — never throws.
+async function fetchWithTimeout(url, opts = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -46,58 +46,102 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 5000) {
 }
 __name(fetchWithTimeout, "fetchWithTimeout");
 
+// Plain GET + parse-JSON helper, for REST endpoints (ARM, Jikan, MAL v2, Anikoto).
+async function fetchJSON(url, headers = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
+  try {
+    const res = await fetchWithTimeout(url, { method: "GET", headers }, timeoutMs);
+    if (!res || !res.ok) return null;
+    return await res.json();
+  } catch (error) {
+    console.error("Fetch error:", error);
+    return null;
+  }
+}
+__name(fetchJSON, "fetchJSON");
+
+// POST + GraphQL helper, for AniList.
+async function fetchGraphQL(url, query, variables = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
+  try {
+    const res = await fetchWithTimeout(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json", "User-Agent": UA },
+      body: JSON.stringify({ query, variables })
+    }, timeoutMs);
+    if (!res || !res.ok) {
+      console.error("Fetch error:", res?.status);
+      return null;
+    }
+    const json = await res.json();
+    if (json.errors) {
+      console.error(json.errors);
+      return null;
+    }
+    return json.data?.Media ?? null;
+  } catch (error) {
+    console.error("Fetch error:", error);
+    return null;
+  }
+}
+__name(fetchGraphQL, "fetchGraphQL");
+
 async function fetchFromAniList(id) {
-  // idMal is included so AniList itself can supply the MyAnimeList id, removing the
-  // hard dependency on the ARM lookup service (which may be down independently).
-  const fullQuery = `query($id:Int){Media(id:$id,type:ANIME){id idMal title{english romaji native} status format episodes seasonYear startDate{year} synonyms nextAiringEpisode{episode airingAt timeUntilAiring}}}`;
-  const res = await fetchWithTimeout("https://graphql.anilist.co", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Accept": "application/json", "User-Agent": UA },
-    body: JSON.stringify({ query: fullQuery, variables: { id } }),
-  }, 5000);
-  if (!res || !res.ok) return null;
-  const json = await res.json().catch(() => null);
-  return json?.data?.Media ?? null;
+  const query = `query($id:Int){Media(id:$id,type:ANIME){id idMal title{english romaji native} status format episodes seasonYear startDate{year} synonyms nextAiringEpisode{episode airingAt timeUntilAiring}}}`;
+  const media = await fetchGraphQL("https://graphql.anilist.co", query, { id });
+  if (!media) return null;
+  return { ...media, status: AL_STATUS_MAP[media.status] ?? media.status };
 }
 __name(fetchFromAniList, "fetchFromAniList");
 
-// Last-resort fallback: hits the official MyAnimeList API v2 directly using a Client ID.
-// Only used when Jikan has failed and AniList has no usable data for this title.
-// Returns a media object shaped like the others, or null if it can't produce one
-// (missing client id, network failure, non-OK response, or malformed payload).
-async function fetchFromMALv2(malId) {
-  if (!MAL_CLIENT_ID) return null;
-  const fields = "id,title,alternative_titles,status,media_type,num_episodes,start_date,start_season";
-  const res = await fetchWithTimeout(`${MAL_API}/anime/${malId}?fields=${fields}`, {
-    headers: { "X-MAL-CLIENT-ID": MAL_CLIENT_ID, "Accept": "application/json", "User-Agent": UA },
-  }, 5000);
-  if (!res || !res.ok) return null;
-  const d = await res.json().catch(() => null);
-  if (!d || !d.id) return null;
+async function fetchFromARM(id) {
+  const data = await fetchJSON(`${ARM}/id/${id}`, { Accept: "application/json", "User-Agent": UA });
+  if (!data) return null;
+  // ARM only maps IDs across services — no title/status/episode info to give back.
+  return { id: data.anilist ?? id, idMal: data.myanimelist ?? null, title: null, status: null, format: null, episodes: null, seasonYear: null, startDate: null, nextAiringEpisode: null, synonyms: [] };
+}
+__name(fetchFromARM, "fetchFromARM");
+
+async function fetchFromJikan(id) {
+  const json = await fetchJSON(`${JIKAN}/anime/${id}`, { Accept: "application/json", "User-Agent": UA });
+  const data = json?.data;
+  if (!data) return null;
   return {
-    id: null, // caller fills in the AniList id
-    idMal: malId,
-    title: {
-      english: d.alternative_titles?.en || null,
-      romaji: d.title ?? null,
-      native: d.alternative_titles?.ja || null,
-    },
-    status: MAL_V2_STATUS_MAP[d.status] ?? "RELEASING",
-    format: d.media_type ? d.media_type.toUpperCase() : null,
-    episodes: d.num_episodes || null,
-    seasonYear: d.start_season?.year ?? (d.start_date ? new Date(d.start_date).getFullYear() : null),
-    startDate: d.start_date ? { year: new Date(d.start_date).getFullYear() } : null,
+    id,
+    idMal: data.mal_id ?? id,
+    title: { english: data.title_english ?? null, romaji: data.title ?? null, native: data.title_japanese ?? null },
+    status: STATUS_MAP[data.status] ?? data.status ?? null,
+    format: data.type ?? null,
+    episodes: data.episodes ?? null,
+    seasonYear: data.year ?? data.aired?.prop?.from?.year ?? null,
+    startDate: data.aired?.prop?.from?.year ? { year: data.aired.prop.from.year } : null,
     nextAiringEpisode: null,
-    synonyms: Array.isArray(d.alternative_titles?.synonyms) ? d.alternative_titles.synonyms : [],
+    synonyms: data.title_synonyms ?? []
+  };
+}
+__name(fetchFromJikan, "fetchFromJikan");
+
+async function fetchFromMALv2(malId) {
+  if (!MAL_CLIENT_ID || !malId) return null;
+  const fields = "id,title,alternative_titles,status,media_type,num_episodes,start_date,start_season";
+  const data = await fetchJSON(`${MAL_API}/anime/${malId}?fields=${fields}`, { "X-MAL-CLIENT-ID": MAL_CLIENT_ID, Accept: "application/json", "User-Agent": UA });
+  if (!data) return null;
+  return {
+    id: null,
+    idMal: data.id ?? malId,
+    title: { english: data.alternative_titles?.en || null, romaji: data.title ?? null, native: data.alternative_titles?.ja || null },
+    status: MAL_V2_STATUS_MAP[data.status] ?? data.status ?? null,
+    format: data.media_type ?? null,
+    episodes: data.num_episodes ?? null,
+    seasonYear: data.start_season?.year ?? null,
+    startDate: data.start_date ? { year: Number(data.start_date.slice(0, 4)) } : null,
+    nextAiringEpisode: null,
+    synonyms: data.alternative_titles?.synonyms ?? []
   };
 }
 __name(fetchFromMALv2, "fetchFromMALv2");
 
 // Turns a title into the kind of slug anikoto expects (e.g. "One Piece" -> "one-piece").
-// Best-effort only — anikoto's real slugs sometimes carry extra suffixes (e.g. "-odmau")
-// that can't be derived from the title alone, so this is a fallback for when no explicit
-// slug/name was supplied, not a guaranteed match. /page's own lookup tolerates the base
-// slug without that suffix, so this is sufficient to resolve the data-id.
+// Best-effort only — real anikoto slugs sometimes carry extra suffixes that can't be
+// derived from the title alone.
 function slugify(title) {
   if (!title) return null;
   return title
@@ -110,211 +154,77 @@ function slugify(title) {
 }
 __name(slugify, "slugify");
 
-// Absolute last resort: anikoto's /page endpoint resolves a title slug to its internal
-// data-id, returned as a plain-text/number body (e.g. "8711"), not a typed JSON payload.
-// We use that id to pull an episode count from /episodes so we can at least return
-// something rather than nothing. Returns a media object shaped like the others, or
-// null if any step fails.
 async function fetchFromAnikoto(name) {
   if (!name) return null;
   const slug = slugify(name);
   if (!slug) return null;
-  const pageRes = await fetchWithTimeout(`${ANIKOTO}/page?name=${encodeURIComponent(slug)}`, {
-    headers: { "Accept": "application/json", "User-Agent": UA },
-  }, 5000);
+
+  const pageRes = await fetchWithTimeout(`${ANIKOTO}/page?name=${encodeURIComponent(slug)}`, { headers: { Accept: "application/json", "User-Agent": UA } });
   if (!pageRes || !pageRes.ok) return null;
-  // Read as text rather than .json() — the body is a bare id like `8711`, sometimes
-  // quoted, and not always served with an application/json content-type, which can
-  // trip up strict fetch implementations' .json() parsing.
-  const pageText = await pageRes.text().catch(() => null);
-  if (!pageText) return null;
-  const dataId = pageText.trim().replace(/^"(.*)"$/, "$1"); // strip surrounding quotes if present
+
+  const pageText = await pageRes.text();
+  const dataId = pageText.trim().replace(/^"(.*)"$/, "$1");
   if (!dataId) return null;
 
-  let episodes = null;
-  const epRes = await fetchWithTimeout(`${ANIKOTO}/episodes?id=${encodeURIComponent(dataId)}`, {
-    headers: { "Accept": "application/json", "User-Agent": UA },
-  }, 5000);
-  if (epRes && epRes.ok) {
-    const epData = await epRes.json().catch(() => null);
-    if (Array.isArray(epData)) episodes = epData.length;
-  }
+  const epRes = await fetchWithTimeout(`${ANIKOTO}/episodes?id=${encodeURIComponent(dataId)}`, { headers: { Accept: "application/json", "User-Agent": UA } });
+  if (!epRes || !epRes.ok) return null;
 
+  const epData = await epRes.json();
   return {
-    id: null, // caller fills in the AniList id
-    idMal: null, // caller fills in if known
-    idAnikoto: dataId,
+    id: null, idMal: null, idAnikoto: dataId,
     title: { english: null, romaji: name, native: null },
-    status: "RELEASING",
-    format: null,
-    episodes,
-    seasonYear: null,
-    startDate: null,
-    nextAiringEpisode: null,
-    synonyms: [],
+    status: "RELEASING", format: null,
+    episodes: Array.isArray(epData) ? epData.length : null,
+    seasonYear: null, startDate: null, nextAiringEpisode: null, synonyms: []
   };
 }
 __name(fetchFromAnikoto, "fetchFromAnikoto");
 
-async function getMedia(anilistId, options) {
-  const anikotoName = options?.anikotoName ?? null;
+async function getMedia(anilistId, options = {}) {
+  const anikotoName = options.anikotoName ?? null;
   const id = Number(anilistId);
   if (resolved.has(id)) return resolved.get(id);
   if (inflight.has(id)) return inflight.get(id);
+
   const promise = (async () => {
-    // AniList is the primary source now, including for the MAL id (idMal), so ARM is
-    // only consulted as a fallback if AniList doesn't give us idMal for some reason.
-    const al = await fetchFromAniList(id);
+    let data = await fetchFromAniList(id);
+    let malId = data?.idMal ?? null;
 
-    let malId = al?.idMal ?? null;
+    if (!data) {
+      data = await fetchFromARM(id);
+      malId = data?.idMal ?? malId;
+    }
+    if (!data) {
+      data = await fetchFromJikan(id);
+      malId = data?.idMal ?? malId;
+    }
+    if (!data && MAL_CLIENT_ID) {
+      data = await fetchFromMALv2(malId ?? id);
+    }
+    if (!data) {
+      data = await fetchFromAnikoto(anikotoName);
+    }
+    if (!data) throw new Error(`No data found for AniList ID ${id}`);
 
-    if (!malId) {
-      const arm = await fetchWithTimeout(`${ARM}?source=anilist&id=${id}`, {
-        headers: { "User-Agent": UA, "Accept": "application/json" }
-      }, 5000).then((r) => {
-        if (!r || !r.ok) return null;
-        return r.json().catch(() => null);
-      }).catch(() => null);
-      malId = arm?.myanimelist ?? null;
-    }
-
-    if (!malId) {
-      if (!al) {
-        // AniList had nothing either: try anikoto as an absolute last resort.
-        const aniko = await fetchFromAnikoto(anikotoName);
-        if (aniko) {
-          aniko.id = id;
-          resolved.set(id, aniko);
-          inflight.delete(id);
-          return aniko;
-        }
-        throw new Error(`No data found for AniList ID ${id} (anikoto fallback also failed or no name supplied)`);
-      }
-      const media = {
-        id,
-        idMal: null,
-        title: {
-          english: al.title?.english ?? null,
-          romaji: al.title?.romaji ?? null,
-          native: al.title?.native ?? null,
-        },
-        status: AL_STATUS_MAP[al.status] ?? "RELEASING",
-        format: al.format ?? null,
-        episodes: al.episodes ?? null,
-        seasonYear: al.seasonYear ?? null,
-        startDate: al.startDate ?? null,
-        nextAiringEpisode: al.nextAiringEpisode ?? null,
-        synonyms: Array.isArray(al.synonyms) ? al.synonyms : [],
-      };
-      resolved.set(id, media);
-      inflight.delete(id);
-      return media;
-    }
-
-    // `al` is already fetched above — no need to fetch AniList again here.
-    let jikan = null;
-    let jikanFailed = false;
-    for (let attempt = 0; attempt <= 4; attempt++) {
-      const r = await fetch(`${JIKAN}/anime/${malId}`, { headers: { "User-Agent": UA, Accept: "application/json" } });
-      if (r.status === 429) {
-        const wait = (parseInt(r.headers.get("Retry-After") ?? "1") || 1) * 1e3 + attempt * 500;
-        if (attempt < 4) {
-          await new Promise((res) => setTimeout(res, wait));
-          continue;
-        }
-        jikanFailed = true;
-        break;
-      }
-      // On 5xx / network errors, fall back to AniList-only data if available rather than hard-failing.
-      if (!r.ok) {
-        if (al) break; // exit loop, jikan stays null, fall through to AniList fallback below
-        jikanFailed = true;
-        break;
-      }
-      jikan = await r.json();
-      break;
-    }
-    const d = jikan?.data ?? null;
-    // If Jikan was unavailable but we have AniList data, build a partial media object from AniList only.
-    if (!d && al) {
-      const media = {
-        id,
-        idMal: malId,
-        title: {
-          english: al.title?.english ?? null,
-          romaji: al.title?.romaji ?? null,
-          native: al.title?.native ?? null,
-        },
-        status: AL_STATUS_MAP[al.status] ?? "RELEASING",
-        format: al.format ?? null,
-        episodes: al.episodes ?? null,
-        seasonYear: al.seasonYear ?? null,
-        startDate: al.startDate ?? null,
-        nextAiringEpisode: al.nextAiringEpisode ?? null,
-        synonyms: Array.isArray(al.synonyms) ? al.synonyms : [],
-      };
-      resolved.set(id, media);
-      inflight.delete(id);
-      return media;
-    }
-    // Jikan failed AND AniList has nothing usable: try the official MyAnimeList API v2 next.
-    if (!d && !al) {
-      const mal = await fetchFromMALv2(malId);
-      if (mal) {
-        mal.id = id;
-        resolved.set(id, mal);
-        inflight.delete(id);
-        return mal;
-      }
-      // MAL API v2 also failed (or no client id configured): try anikoto as the absolute last resort.
-      const aniko = await fetchFromAnikoto(anikotoName);
-      if (aniko) {
-        aniko.id = id;
-        aniko.idMal = malId;
-        resolved.set(id, aniko);
-        inflight.delete(id);
-        return aniko;
-      }
-      throw new Error(
-        jikanFailed
-          ? `Jikan failed and AniList had no data for MAL ID ${malId} (MAL API v2 and anikoto fallbacks also failed)`
-          : `Jikan returned no data for MAL ID ${malId} (AniList, MAL API v2, and anikoto fallbacks also failed)`
-      );
-    }
-    if (!d) throw new Error(`Jikan returned no data for MAL ID ${malId}`);
-    const media = {
-      id,
-      idMal: malId,
-      title: {
-        english: al?.title?.english ?? d.title_english ?? null,
-        romaji: al?.title?.romaji ?? d.title ?? null,
-        native: al?.title?.native ?? d.title_japanese ?? null,
-      },
-      status: AL_STATUS_MAP[al?.status] ?? STATUS_MAP[d.status] ?? "RELEASING",
-      format: al?.format ?? d.type ?? null,
-      episodes: al?.episodes ?? d.episodes ?? null,
-      seasonYear: al?.seasonYear ?? d.year ?? null,
-      startDate: al?.startDate ?? (d.aired?.from ? { year: new Date(d.aired.from).getFullYear() } : null),
-      nextAiringEpisode: al?.nextAiringEpisode ?? null,
-      synonyms: [
-        ...(d.titles?.map((t) => t.title).filter(Boolean) ?? []),
-        ...(Array.isArray(al?.synonyms) ? al.synonyms : []),
-      ],
-    };
-    resolved.set(id, media);
+    resolved.set(id, data);
     inflight.delete(id);
-    return media;
+    return data;
   })().catch((e) => {
     inflight.delete(id);
+    console.error("Error fetching media:", e);
     throw e;
   });
+
   inflight.set(id, promise);
   return promise;
 }
 __name(getMedia, "getMedia");
 
 function forgetMedia(anilistId) {
-  resolved.delete(Number(anilistId));
+  const id = Number(anilistId);
+  resolved.delete(id);
+  inflight.delete(id);
 }
+__name(forgetMedia, "forgetMedia");
 
 export { getMedia, forgetMedia };
