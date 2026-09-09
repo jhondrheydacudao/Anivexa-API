@@ -5,11 +5,20 @@ var inflight = new Map();
 var UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 var ARM = "https://arm.haglund.dev/api/v2/ids";
 var JIKAN = "https://api.jikan.moe/v4";
+var MAL_API = "https://api.myanimelist.net/v2";
+var MAL_CLIENT_ID = process.env.MAL_CLIENT_ID ?? null;
 var STATUS_MAP = {
   "Currently Airing": "RELEASING",
   "Finished Airing": "FINISHED",
   "Not yet aired": "NOT_YET_RELEASED",
   "On Hiatus": "HIATUS"
+};
+
+// Status enum used by the official MyAnimeList API v2 (distinct from Jikan's STATUS_MAP strings above).
+var MAL_V2_STATUS_MAP = {
+  currently_airing: "RELEASING",
+  finished_airing: "FINISHED",
+  not_yet_aired: "NOT_YET_RELEASED",
 };
 
 const AL_STATUS_MAP = {
@@ -31,6 +40,39 @@ async function fetchFromAniList(id) {
   const json = await res.json();
   return json.data?.Media ?? null;
 }
+__name(fetchFromAniList, "fetchFromAniList");
+
+// Last-resort fallback: hits the official MyAnimeList API v2 directly using a Client ID.
+// Only used when Jikan has failed and AniList has no usable data for this title.
+// Returns a media object shaped like the others, or null if it can't produce one
+// (missing client id, network failure, non-OK response, or malformed payload).
+async function fetchFromMALv2(malId) {
+  if (!MAL_CLIENT_ID) return null;
+  const fields = "id,title,alternative_titles,status,media_type,num_episodes,start_date,start_season";
+  const res = await fetch(`${MAL_API}/anime/${malId}?fields=${fields}`, {
+    headers: { "X-MAL-CLIENT-ID": MAL_CLIENT_ID, "Accept": "application/json", "User-Agent": UA },
+  }).catch(() => null);
+  if (!res || !res.ok) return null;
+  const d = await res.json().catch(() => null);
+  if (!d || !d.id) return null;
+  return {
+    id: null, // caller fills in the AniList id
+    idMal: malId,
+    title: {
+      english: d.alternative_titles?.en || null,
+      romaji: d.title ?? null,
+      native: d.alternative_titles?.ja || null,
+    },
+    status: MAL_V2_STATUS_MAP[d.status] ?? "RELEASING",
+    format: d.media_type ? d.media_type.toUpperCase() : null,
+    episodes: d.num_episodes || null,
+    seasonYear: d.start_season?.year ?? (d.start_date ? new Date(d.start_date).getFullYear() : null),
+    startDate: d.start_date ? { year: new Date(d.start_date).getFullYear() } : null,
+    nextAiringEpisode: null,
+    synonyms: Array.isArray(d.alternative_titles?.synonyms) ? d.alternative_titles.synonyms : [],
+  };
+}
+__name(fetchFromMALv2, "fetchFromMALv2");
 
 async function getMedia(anilistId) {
   const id = Number(anilistId);
@@ -72,6 +114,7 @@ async function getMedia(anilistId) {
 
     const al = await fetchFromAniList(id).catch(() => null);
     let jikan = null;
+    let jikanFailed = false;
     for (let attempt = 0; attempt <= 4; attempt++) {
       const r = await fetch(`${JIKAN}/anime/${malId}`, { headers: { "User-Agent": UA, Accept: "application/json" } });
       if (r.status === 429) {
@@ -80,12 +123,14 @@ async function getMedia(anilistId) {
           await new Promise((res) => setTimeout(res, wait));
           continue;
         }
-        throw new Error(`Jikan 429 for MAL ID ${malId} (exhausted retries)`);
+        jikanFailed = true;
+        break;
       }
       // On 5xx / network errors, fall back to AniList-only data if available rather than hard-failing.
       if (!r.ok) {
         if (al) break; // exit loop, jikan stays null, fall through to AniList fallback below
-        throw new Error(`Jikan ${r.status}`);
+        jikanFailed = true;
+        break;
       }
       jikan = await r.json();
       break;
@@ -112,6 +157,21 @@ async function getMedia(anilistId) {
       resolved.set(id, media);
       inflight.delete(id);
       return media;
+    }
+    // Jikan failed AND AniList has nothing usable: try the official MyAnimeList API v2 as a last resort.
+    if (!d && !al) {
+      const mal = await fetchFromMALv2(malId);
+      if (mal) {
+        mal.id = id;
+        resolved.set(id, mal);
+        inflight.delete(id);
+        return mal;
+      }
+      throw new Error(
+        jikanFailed
+          ? `Jikan failed and AniList had no data for MAL ID ${malId} (MAL API v2 fallback also failed or unavailable)`
+          : `Jikan returned no data for MAL ID ${malId} (AniList and MAL API v2 fallback also failed)`
+      );
     }
     if (!d) throw new Error(`Jikan returned no data for MAL ID ${malId}`);
     const media = {
